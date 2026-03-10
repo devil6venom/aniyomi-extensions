@@ -4,105 +4,226 @@ on:
   push:
     branches:
       - master
-    paths:
-      - '**'
-      - '!**.md'
-      - '!.github/**'
-      - '.github/scripts/**'
-      - '.github/workflows/build_push.yml'
+  workflow_dispatch:
+    inputs:
+      extension:
+        description: "Extension module to build (e.g. all.pornhub). Leave blank for ALL."
+        required: false
+        default: ""
 
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build extensions
-    runs-on: 'ubuntu-24.04'
+    name: Build & publish APKs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to push to repo branch
 
     steps:
-      - name: Checkout master branch
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      # ── 1. Check out source (master) ──────────────────────────────────────
+      - name: Checkout master
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0
           ref: master
+          path: master
+          fetch-depth: 0
 
-      - name: Set up java
-        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+      # ── 2. Check out (or create) the repo branch ───────────────────────────
+      - name: Checkout repo branch
+        uses: actions/checkout@v4
+        with:
+          ref: repo
+          path: repo
+          fetch-depth: 0
+        # If repo branch doesn't exist yet, this step is skipped and we create it below
+        continue-on-error: true
+
+      - name: Create repo branch if it does not exist
+        run: |
+          if [ ! -d repo/.git ]; then
+            echo "repo branch not found — creating orphan branch"
+            mkdir -p repo
+            cd repo
+            git init
+            git remote add origin https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
+            git checkout --orphan repo
+            echo "# APK repo branch" > README.md
+            git add README.md
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "Init repo branch"
+            git push origin repo
+          fi
+
+      # ── 3. Java & Gradle setup ─────────────────────────────────────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
           java-version: 17
           distribution: temurin
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@ac638b010cf58a27ee6c972d7336334ccaf61c96 # v4.4.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
 
-      - name: Prepare signing key
+      - name: Write CI gradle.properties
         run: |
-          echo ${{ secrets.SIGNING_KEY }} | base64 -d > signingkey.jks
+          mkdir -p ~/.gradle
+          cat > ~/.gradle/gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=512m
+          org.gradle.daemon=false
+          org.gradle.parallel=true
+          org.gradle.configureondemand=true
+          kotlin.incremental=false
+          EOF
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
-
-      - name: Check code format
-        run: ./gradlew spotlessCheck
-
-      - name: Build extensions
+      # ── 4. Build ───────────────────────────────────────────────────────────
+      - name: Build specific extension
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.extension != '' }}
+        working-directory: master
+        run: ./gradlew :src:${{ github.event.inputs.extension }}:assembleDebug
         env:
-          ALIAS: ${{ secrets.ALIAS }}
-          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: ./gradlew -p src assembleRelease
+          CI_PUSH: "true"
 
-      - name: Upload APKs
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: "github.repository == 'Secozzi/aniyomi-extensions'"
-        with:
-          name: "individual-apks"
-          path: "**/*.apk"
-          retention-days: 1
+      - name: Build all extensions
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.extension == '' }}
+        working-directory: master
+        run: ./gradlew assembleDebug
+        env:
+          CI_PUSH: "true"
 
-      - name: Clean up CI files
-        run: rm signingkey.jks
-
-  publish_repo:
-    name: Publish repo
-    needs:
-      - build
-    if: "github.repository == 'Secozzi/aniyomi-extensions'"
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download APK artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          path: ~/apk-artifacts
-
-      - name: Set up JDK
-        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
-        with:
-          java-version: 17
-          distribution: temurin
-
-      - name: Checkout master branch
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: master
-          path: master
-
-      - name: Create repo artifacts
+      # ── 5. Collect APKs & build index ─────────────────────────────────────
+      - name: Collect APKs and generate index
         run: |
-          cd master
-          python ./.github/scripts/move-apks.py
-          python ./.github/scripts/create-repo.py
+          set -e
 
-      - name: Checkout repo branch
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: Secozzi/aniyomi-extensions
-          ref: repo
-          path: repo
+          # Find all built APKs
+          APK_DIR="master/apk"
+          mkdir -p "$APK_DIR"
+
+          find master -name "*.apk" \
+            -path "*/debug/*" \
+            -not -path "*/intermediates/*" \
+            | while read apk; do
+              cp "$apk" "$APK_DIR/"
+            done
+
+          APK_COUNT=$(ls "$APK_DIR"/*.apk 2>/dev/null | wc -l)
+          echo "Collected $APK_COUNT APK(s) into $APK_DIR"
+          ls -lh "$APK_DIR" || true
+
+          # Generate index.min.json using aapt2 (bundled with Android build tools)
+          # Locate aapt2
+          AAPT2=$(find $ANDROID_HOME/build-tools -name "aapt2" | sort -rV | head -1)
+          echo "Using aapt2: $AAPT2"
+
+          python3 - "$APK_DIR" "$AAPT2" << 'PYEOF'
+          import sys, os, json, subprocess, re
+
+          apk_dir = sys.argv[1]
+          aapt2   = sys.argv[2]
+
+          entries = []
+
+          for apk_file in sorted(os.listdir(apk_dir)):
+              if not apk_file.endswith(".apk"):
+                  continue
+
+              apk_path = os.path.join(apk_dir, apk_file)
+
+              try:
+                  result = subprocess.run(
+                      [aapt2, "dump", "badging", apk_path],
+                      capture_output=True, text=True, timeout=30
+                  )
+                  output = result.stdout + result.stderr
+              except Exception as e:
+                  print(f"  WARN: aapt2 failed for {apk_file}: {e}")
+                  continue
+
+              def get(pattern, text, group=1, default=""):
+                  m = re.search(pattern, text)
+                  return m.group(group) if m else default
+
+              pkg      = get(r"package: name='([^']+)'", output)
+              vercode  = get(r"versionCode='([^']+)'", output)
+              vername  = get(r"versionName='([^']+)'", output)
+              label    = get(r"application-label:'([^']+)'", output)
+              lang     = get(r"tachiyomi.animeextension.lang:value='([^']+)'", output)
+              nsfw_raw = get(r"tachiyomi.animeextension.nsfw:value='([^']+)'", output, default="0")
+              nsfw     = int(nsfw_raw) if nsfw_raw.isdigit() else 0
+
+              # Source name is everything after the last dot in the package
+              ext_name = pkg.split(".")[-1] if pkg else apk_file
+
+              if not pkg:
+                  print(f"  SKIP {apk_file}: could not read package name")
+                  continue
+
+              entry = {
+                  "name":    label or ext_name,
+                  "pkg":     pkg,
+                  "apk":     apk_file,
+                  "lang":    lang or "all",
+                  "code":    int(vercode) if vercode.isdigit() else 1,
+                  "version": vername or "1.0",
+                  "nsfw":    nsfw,
+                  "sources": [
+                      {
+                          "name":      label or ext_name,
+                          "lang":      lang or "all",
+                          "id":        str(abs(hash(pkg)) % (10**18)),
+                          "baseUrl":   "",
+                          "versionId": 1,
+                      }
+                  ],
+              }
+              entries.append(entry)
+              print(f"  + {apk_file}  ({pkg}  v{vername})")
+
+          out_path = os.path.join(apk_dir, "index.min.json")
+          with open(out_path, "w") as f:
+              json.dump(entries, f, separators=(",", ":"))
+
+          print(f"\nWrote {len(entries)} entr(ies) to {out_path}")
+          PYEOF
+
+      # ── 6. Deploy to repo branch ───────────────────────────────────────────
+      - name: Deploy to repo branch
+        run: |
+          set -e
+
+          DEST="repo"
+          SRC="master/apk"
+
+          # Copy APKs and index into repo branch checkout
+          cp "$SRC"/*.apk "$DEST/" 2>/dev/null || true
+          cp "$SRC/index.min.json" "$DEST/"
+
+          cd "$DEST"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Set the correct remote with token auth
+          git remote set-url origin \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+
+          git add .
+
+          if git diff --cached --quiet; then
+            echo "Nothing changed — repo branch already up to date."
+          else
+            TRIGGER="${{ github.event_name }}"
+            EXT="${{ github.event.inputs.extension }}"
+            MSG="Update extensions"
+            [ "$TRIGGER" = "workflow_dispatch" ] && [ -n "$EXT" ] && MSG="Build: $EXT"
+            git commit -m "$MSG ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+            git push origin repo
+            echo "✅ Pushed to repo branch."
+          fi
           
-      - name: Deploy repo
-        run: |
-          cd repo
-          chmod +x ../master/.github/scripts/commit-repo.sh
-          ../master/.github/scripts/commit-repo.sh
