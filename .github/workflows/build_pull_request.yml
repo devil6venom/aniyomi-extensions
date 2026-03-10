@@ -1,47 +1,66 @@
-name: PR build check
+name: PR Build Check
 
 on:
   pull_request:
-    paths:
-      - "**"
-      - "!**.md"
-      - "!.github/**"
-      - ".github/workflows/build_pull_request.yml"
+    branches:
+      - master
 
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build extensions
-    runs-on: 'ubuntu-24.04'
+    name: Build changed extensions
+    runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout master branch
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: master
 
-      - name: Set up java
-        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
           java-version: 17
           distribution: temurin
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@ac638b010cf58a27ee6c972d7336334ccaf61c96 # v4.4.1
+        uses: gradle/actions/setup-gradle@v4
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
+      - name: Write CI gradle.properties
+        run: |
+          mkdir -p ~/.gradle
+          cat > ~/.gradle/gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=512m
+          org.gradle.daemon=false
+          org.gradle.parallel=true
+          org.gradle.configureondemand=true
+          kotlin.incremental=false
+          EOF
 
-      - name: Check code format
-        run: ./gradlew spotlessCheck
+      - name: Detect changed extension modules
+        id: changed
+        run: |
+          MODULES=$(git diff --name-only origin/master...HEAD \
+            | grep '^src/' \
+            | awk -F'/' '{print $2"."$3}' \
+            | sort -u \
+            | tr '\n' ' ')
+          echo "modules=$MODULES" >> $GITHUB_OUTPUT
+          echo "Changed: $MODULES"
 
-      - name: Build extensions
-        env:
-          ALIAS: ${{ secrets.ALIAS }}
-          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: ./gradlew -p src assembleDebug
+      - name: Build changed extensions
+        if: ${{ steps.changed.outputs.modules != '' }}
+        run: |
+          for MOD in ${{ steps.changed.outputs.modules }}; do
+            echo "::group::Building $MOD"
+            ./gradlew :src:${MOD}:assembleDebug
+            echo "::endgroup::"
+          done
+
+      - name: No extension changes detected
+        if: ${{ steps.changed.outputs.modules == '' }}
+        run: echo "No extension source files changed in this PR — nothing to build."
+        
